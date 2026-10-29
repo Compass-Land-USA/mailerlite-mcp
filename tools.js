@@ -1,4 +1,6 @@
 const API_BASE = "https://api.mailerlite.com/api/v2";
+// Largest page the /campaigns/:status list accepts in one call.
+const CAMPAIGN_PAGE = 1000;
 
 export function buildTools(apiKey) {
   async function ml(path, { method = "GET", body } = {}) {
@@ -23,6 +25,20 @@ export function buildTools(apiKey) {
     return data;
   }
 
+  // v2 has no single-campaign GET: /campaigns/:x is the list-by-status route.
+  // Walk the sent, outbox and draft lists (newest first) until the id turns up.
+  async function findCampaign(campaign_id) {
+    for (const status of ["sent", "outbox", "draft"]) {
+      for (let offset = 0; ; offset += CAMPAIGN_PAGE) {
+        const page = await ml(`/campaigns/${status}?limit=${CAMPAIGN_PAGE}&offset=${offset}&order=DESC`);
+        const match = page.find((c) => String(c.id) === String(campaign_id));
+        if (match) return match;
+        if (page.length < CAMPAIGN_PAGE) break;
+      }
+    }
+    throw new Error(`Campaign ${campaign_id} not found in sent, outbox or draft campaigns`);
+  }
+
   return [
     {
       name: "list_groups",
@@ -36,66 +52,83 @@ export function buildTools(apiKey) {
     },
     {
       name: "list_segments",
-      description: "List MailerLite segments. Use to find a segment_id before creating a campaign.",
+      description:
+        "List MailerLite segments: id, title, total subscribers, and aggregate sent/opened/clicked counts. Use to find a segment_id before creating a campaign.",
       inputSchema: {
         type: "object",
         properties: { limit: { type: "number", description: "Max segments to return (default 50)" } },
       },
-      handler: async ({ limit = 50 }) => ml(`/segments?limit=${limit}`),
+      // The raw payload includes each segment's filter rules, which can contain
+      // subscriber email addresses; only the summary fields are passed on.
+      handler: async ({ limit = 50 }) => {
+        const res = await ml(`/segments?limit=${limit}`);
+        return (res.data || []).map(({ id, title, total, sent, opened, clicked }) => ({
+          id, title, total, sent, opened, clicked,
+        }));
+      },
     },
     {
       name: "list_campaigns",
       description:
-        "List campaigns by status. status = sent | outbox (scheduled) | draft. Returns recent campaigns with subject, date, and aggregate stats when sent.",
+        "List campaigns by status, newest first. status = sent | outbox (scheduled) | draft. Returns id, name, subject, dates, recipients, and opened/clicked count + rate (sent campaigns only).",
       inputSchema: {
         type: "object",
         properties: {
           status: { type: "string", enum: ["sent", "outbox", "draft"], description: "Default: sent" },
           limit: { type: "number", description: "Default 10" },
+          offset: { type: "number", description: "Skip this many campaigns, for paging. Default 0" },
         },
       },
-      handler: async ({ status = "sent", limit = 10 }) =>
-        ml(`/campaigns/${status}?limit=${limit}`),
+      handler: async ({ status = "sent", limit = 10, offset = 0 }) =>
+        ml(`/campaigns/${status}?limit=${limit}&offset=${offset}&order=DESC`),
     },
     {
       name: "get_campaign",
-      description: "Fetch details for a single campaign by id.",
+      description:
+        "Fetch one campaign by id (searches sent, scheduled and draft campaigns): name, subject, status, type, dates, recipients, and opened/clicked count + rate when sent.",
       inputSchema: {
         type: "object",
         properties: { campaign_id: { type: ["string", "number"] } },
         required: ["campaign_id"],
       },
-      handler: async ({ campaign_id }) => ml(`/campaigns/${campaign_id}`),
+      handler: async ({ campaign_id }) => findCampaign(campaign_id),
     },
     {
       name: "create_campaign_draft",
       description:
-        "Step 1 of the send flow. Creates a regular campaign as a DRAFT with subject/from/audience. Returns the new campaign id. Content is added separately via set_campaign_content. Does NOT send.",
+        "Step 1 of the send flow. Creates a regular campaign as a DRAFT with subject/from/audience. Returns the new campaign id. Content is added separately via set_campaign_content. Does NOT send. If segment_ids are given, MailerLite ignores group_ids.",
       inputSchema: {
         type: "object",
         properties: {
           subject: { type: "string" },
           from_email: { type: "string" },
           from_name: { type: "string" },
-          name: { type: "string", description: "Internal campaign name (optional)" },
-          language_id: { type: "number", description: "Optional — account default used if omitted" },
+          name: { type: "string", description: "Internal campaign name. Defaults to the subject." },
+          language: { type: "string", description: "Language code, e.g. 'en'. Optional — account default used if omitted" },
           group_ids: {
             type: "array",
             items: { type: ["string", "number"] },
             description: "At least one of group_ids or segment_ids is required.",
           },
-          segment_ids: { type: "array", items: { type: ["string", "number"] } },
+          segment_ids: {
+            type: "array",
+            items: { type: ["string", "number"] },
+            description: "If given, group_ids are ignored.",
+          },
         },
         required: ["subject", "from_email", "from_name"],
       },
       handler: async (args) => {
+        if (!args.group_ids?.length && !args.segment_ids?.length) {
+          throw new Error("At least one of group_ids or segment_ids is required");
+        }
         const payload = {
           type: "regular",
+          name: args.name || args.subject,
           subject: args.subject,
           from: args.from_email,
           from_name: args.from_name,
-          ...(args.name ? { name: args.name } : {}),
-          ...(args.language_id ? { language_id: args.language_id } : {}),
+          ...(args.language ? { language: args.language } : {}),
           ...(args.group_ids?.length ? { groups: args.group_ids } : {}),
           ...(args.segment_ids?.length ? { segments: args.segment_ids } : {}),
         };
@@ -105,7 +138,7 @@ export function buildTools(apiKey) {
     {
       name: "set_campaign_content",
       description:
-        "Step 2 of the send flow. Sets HTML and plain-text content on a draft campaign. HTML must include an unsubscribe link token — MailerLite v2 requires {$unsubscribe} somewhere in the HTML.",
+        "Step 2 of the send flow. Sets HTML and plain-text content on a draft campaign. The HTML must be a full document with <head> and <body> tags, and must include the unsubscribe token {$unsubscribe}.",
       inputSchema: {
         type: "object",
         properties: {
@@ -121,7 +154,7 @@ export function buildTools(apiKey) {
     {
       name: "schedule_campaign",
       description:
-        "Step 3 of the send flow. Schedules or immediately sends a draft campaign. type='instant' sends now; type='schedule' requires date (YYYY-MM-DD HH:MM in account timezone). For DOTW always use 'schedule' at least 24h out to leave human review time.",
+        "Step 3 of the send flow. Schedules or immediately sends a draft campaign that has content. type='instant' sends now; type='schedule' requires date (YYYY-MM-DD HH:MM in the account timezone, see get_account). For DOTW always use 'schedule' at least 24h out to leave human review time.",
       inputSchema: {
         type: "object",
         properties: {
@@ -129,19 +162,20 @@ export function buildTools(apiKey) {
           type: { type: "string", enum: ["instant", "schedule"] },
           date: { type: "string", description: "YYYY-MM-DD HH:MM (required if type=schedule)" },
           analytics: { type: "number", description: "1 to enable link tracking (default 1)" },
-          followup_schedule: {
-            type: "string",
-            enum: ["specific", "timezone"],
-            description: "specific = single moment; timezone = per-subscriber timezone. Default specific.",
-          },
         },
         required: ["campaign_id", "type"],
       },
-      handler: async ({ campaign_id, type, date, analytics = 1, followup_schedule = "specific" }) => {
-        const body = { type, analytics };
+      // The API takes type 1 (send now, its default) or 2 (schedule).
+      handler: async ({ campaign_id, type, date, analytics = 1 }) => {
+        if (type !== "instant" && type !== "schedule") {
+          throw new Error("type must be 'instant' or 'schedule'");
+        }
+        const body = { type: type === "schedule" ? 2 : 1, analytics };
         if (type === "schedule") {
+          if (!date || !/^\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}$/.test(date)) {
+            throw new Error("type='schedule' requires date as YYYY-MM-DD HH:MM");
+          }
           body.date = date;
-          body.followup_schedule = followup_schedule;
         }
         return ml(`/campaigns/${campaign_id}/actions/send`, { method: "POST", body });
       },
@@ -158,7 +192,7 @@ export function buildTools(apiKey) {
     },
     {
       name: "delete_campaign",
-      description: "Delete a draft campaign permanently.",
+      description: "Delete a campaign permanently. A scheduled (outbox) campaign must be cancelled with cancel_campaign first.",
       inputSchema: {
         type: "object",
         properties: { campaign_id: { type: ["string", "number"] } },
@@ -169,29 +203,37 @@ export function buildTools(apiKey) {
     {
       name: "get_campaign_stats",
       description:
-        "Get aggregate stats for a sent campaign: opened, clicked, unsubscribed, bounced, total, open_rate, click_rate.",
+        "Get stats for a sent campaign: recipients, opens and clicks (count + rate %). Unsubscribe and bounce counts per campaign are not available in the MailerLite Classic API.",
       inputSchema: {
         type: "object",
         properties: { campaign_id: { type: ["string", "number"] } },
         required: ["campaign_id"],
       },
       handler: async ({ campaign_id }) => {
-        const c = await ml(`/campaigns/${campaign_id}`);
+        const c = await findCampaign(campaign_id);
         return {
           id: c.id,
           subject: c.subject,
           name: c.name,
           status: c.status,
           date_send: c.date_send,
-          opened: c.opened,
-          open_rate: c.opened_rate,
-          clicked: c.clicked,
-          click_rate: c.clicked_rate,
-          unsubscribed: c.unsubscribed,
-          bounced: c.bounced,
           total_recipients: c.total_recipients,
+          opened: c.opened?.count ?? 0,
+          open_rate: c.opened?.rate ?? 0,
+          clicked: c.clicked?.count ?? 0,
+          click_rate: c.clicked?.rate ?? 0,
         };
       },
+    },
+    {
+      name: "get_account_stats",
+      description:
+        "Account-wide stats: subscribed and unsubscribed totals, campaigns sent, emails sent, and overall open/click/bounce rates (fractions, e.g. 0.29 = 29%). Pass timestamp (UNIX seconds) to get the values as of a past date.",
+      inputSchema: {
+        type: "object",
+        properties: { timestamp: { type: "number", description: "Optional UNIX timestamp for a past point in time" } },
+      },
+      handler: async ({ timestamp }) => ml(timestamp ? `/stats?timestamp=${timestamp}` : `/stats`),
     },
     {
       name: "get_account",

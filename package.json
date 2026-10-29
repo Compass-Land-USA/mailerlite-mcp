@@ -2,10 +2,10 @@
   "name": "mailerlite-mcp",
   "version": "0.1.0",
   "type": "module",
-  "description": "MCP server for MailerLite Classic v2 — list groups/segments, create and schedule campaigns, fetch stats. Stdio for local use, HTTP for Railway deployment.",
+  "description": "MCP server for MailerLite Classic v2 — list groups/segments, create and schedule campaigns, fetch stats. Stdio for local use, HTTP for the vps1 deployment.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --env-file-if-exists=.env server.js",
     "start:stdio": "node index.js"
   },
   "dependencies": {
